@@ -68,7 +68,7 @@ def health_check():
 @app.route('/download-audio-base64', methods=['POST'])
 def download_audio_base64():
     """
-    Download video, extract audio, and return as base64
+    Download video audio and return as base64 (no ffmpeg conversion)
     
     Request body:
     {
@@ -97,14 +97,9 @@ def download_audio_base64():
         with tempfile.TemporaryDirectory() as temp_dir:
             output_template = os.path.join(temp_dir, 'audio.%(ext)s')
             
-            # yt-dlp options for audio download
+            # yt-dlp options for audio download (no conversion)
             base_opts = {
                 'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
                 'outtmpl': output_template,
                 'quiet': True,
                 'no_warnings': True,
@@ -118,16 +113,32 @@ def download_audio_base64():
                 info = ydl.extract_info(video_url, download=True)
                 
                 # Find the downloaded audio file
-                audio_file = os.path.join(temp_dir, 'audio.mp3')
+                downloaded_file = None
+                for file in os.listdir(temp_dir):
+                    if file.startswith('audio.'):
+                        downloaded_file = os.path.join(temp_dir, file)
+                        break
                 
-                if not os.path.exists(audio_file):
+                if not downloaded_file or not os.path.exists(downloaded_file):
                     return jsonify({
                         "success": False,
                         "error": "Audio file was not created"
                     }), 500
                 
+                # Determine MIME type from extension
+                ext = os.path.splitext(downloaded_file)[1].lower()
+                mime_type_map = {
+                    '.mp3': 'audio/mpeg',
+                    '.m4a': 'audio/mp4',
+                    '.webm': 'audio/webm',
+                    '.opus': 'audio/opus',
+                    '.ogg': 'audio/ogg',
+                    '.wav': 'audio/wav',
+                }
+                mime_type = mime_type_map.get(ext, 'audio/mpeg')
+                
                 # Read audio file and encode to base64
-                with open(audio_file, 'rb') as f:
+                with open(downloaded_file, 'rb') as f:
                     audio_data = f.read()
                     audio_base64 = base64.b64encode(audio_data).decode('utf-8')
                 
@@ -142,14 +153,14 @@ def download_audio_base64():
                 response_data = {
                     "success": True,
                     "audio_base64": audio_base64,
-                    "mime_type": "audio/mpeg",
+                    "mime_type": mime_type,
                     "title": info.get('title', 'Unknown'),
                     "duration": info.get('duration', 0),
                     "platform": info.get('extractor', 'unknown'),
                     "file_size_mb": round(file_size_mb, 2)
                 }
                 
-                logger.info(f"Successfully processed audio: {info.get('title')} ({file_size_mb:.2f}MB)")
+                logger.info(f"Successfully processed audio: {info.get('title')} ({file_size_mb:.2f}MB, {mime_type})")
                 return jsonify(response_data)
             
     except yt_dlp.utils.DownloadError as e:
