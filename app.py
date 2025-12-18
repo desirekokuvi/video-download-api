@@ -1,265 +1,213 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yt_dlp
-import os
-import tempfile
-import logging
-import json
 import base64
+import os
+import json
+import tempfile
 
 app = Flask(__name__)
-CORS(app)  # Allow requests from your Manus app
+CORS(app)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Instagram cookie configuration
-INSTAGRAM_COOKIES = os.environ.get('INSTAGRAM_COOKIES', '')
-
-def get_ydl_opts_with_cookies(base_opts):
-    """Add Instagram cookies to yt-dlp options if available"""
-    opts = base_opts.copy()
+def get_ydl_opts_with_cookies():
+    """Load Instagram cookies from environment variable if available"""
+    cookies_json = os.getenv('INSTAGRAM_COOKIES')
     
-    if INSTAGRAM_COOKIES:
+    base_opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+    }
+    
+    if cookies_json:
         try:
-            # Parse cookies from environment variable (JSON format)
-            cookies_data = json.loads(INSTAGRAM_COOKIES)
+            cookies = json.loads(cookies_json)
             
-            # Create a temporary cookies file for yt-dlp
-            cookie_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+            # Create temporary cookies file
+            temp_cookies = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
             
-            # Write cookies in Netscape format
-            cookie_file.write("# Netscape HTTP Cookie File\n")
-            for cookie in cookies_data:
-                domain = cookie.get('domain', '.instagram.com')
-                flag = 'TRUE' if domain.startswith('.') else 'FALSE'
-                path = cookie.get('path', '/')
-                secure = 'TRUE' if cookie.get('secure', False) else 'FALSE'
-                expiration = str(int(cookie.get('expirationDate', 0)))
-                name = cookie.get('name', '')
-                value = cookie.get('value', '')
-                
-                cookie_file.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expiration}\t{name}\t{value}\n")
+            # Convert JSON cookies to Netscape format
+            temp_cookies.write("# Netscape HTTP Cookie File\n")
+            for cookie in cookies:
+                if cookie.get('name') and cookie.get('value'):
+                    domain = cookie.get('domain', '.instagram.com')
+                    path = cookie.get('path', '/')
+                    secure = 'TRUE' if cookie.get('secure', False) else 'FALSE'
+                    expires = str(cookie.get('expirationDate', 0)).split('.')[0]
+                    name = cookie['name']
+                    value = cookie['value']
+                    
+                    temp_cookies.write(f"{domain}\tTRUE\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
             
-            cookie_file.close()
-            opts['cookiefile'] = cookie_file.name
-            logger.info("Instagram cookies loaded successfully")
+            temp_cookies.close()
+            
+            base_opts['cookiefile'] = temp_cookies.name
+            print(f"Instagram cookies loaded successfully from {temp_cookies.name}", flush=True)
             
         except json.JSONDecodeError:
-            logger.warning("Failed to parse INSTAGRAM_COOKIES - using simple string format")
-            # Fallback: treat as simple sessionid cookie
-            cookie_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
-            cookie_file.write("# Netscape HTTP Cookie File\n")
-            cookie_file.write(f".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\t{INSTAGRAM_COOKIES}\n")
-            cookie_file.close()
-            opts['cookiefile'] = cookie_file.name
-            logger.info("Instagram sessionid cookie loaded")
+            # Try simple sessionid format
+            if cookies_json.startswith('sessionid=') or len(cookies_json) > 20:
+                temp_cookies = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+                temp_cookies.write("# Netscape HTTP Cookie File\n")
+                
+                sessionid = cookies_json.replace('sessionid=', '').strip()
+                temp_cookies.write(f".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\t{sessionid}\n")
+                temp_cookies.close()
+                
+                base_opts['cookiefile'] = temp_cookies.name
+                print(f"Instagram sessionid loaded successfully", flush=True)
+            else:
+                print("Failed to parse INSTAGRAM_COOKIES", flush=True)
         except Exception as e:
-            logger.error(f"Error loading Instagram cookies: {str(e)}")
+            print(f"Error loading cookies: {str(e)}", flush=True)
     
-    return opts
+    return base_opts
+
+def format_error_message(error_str):
+    """Convert technical yt-dlp errors to user-friendly messages"""
+    error_lower = error_str.lower()
+    
+    if 'unable to extract' in error_lower or 'empty media response' in error_lower:
+        return "This video may be restricted, private, or deleted. Please try a different public video."
+    elif 'rate-limit' in error_lower or 'too many requests' in error_lower:
+        return "Instagram rate limit reached. Please wait a few minutes and try again."
+    elif 'login required' in error_lower or 'not available' in error_lower:
+        return "This video requires authentication or is not publicly available."
+    elif 'video not found' in error_lower or '404' in error_lower:
+        return "Video not found. It may have been deleted or the URL is incorrect."
+    else:
+        return f"Unable to download video: {error_str}"
 
 @app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({"status": "healthy", "service": "video-download-api"})
+def health():
+    return jsonify({
+        'status': 'healthy',
+        'service': 'video-download-api'
+    })
 
 @app.route('/download-audio-base64', methods=['POST'])
 def download_audio_base64():
-    """
-    Download video audio and return as base64 (no ffmpeg conversion)
-    
-    Request body:
-    {
-        "url": "https://www.tiktok.com/...",
-    }
-    
-    Response:
-    {
-        "success": true,
-        "audio_base64": "base64-encoded-audio-data",
-        "mime_type": "audio/mpeg",
-        "title": "Video Title",
-        "duration": 30
-    }
-    """
     try:
-        data = request.json
-        video_url = data.get('url')
+        data = request.get_json()
+        url = data.get('url')
         
-        if not video_url:
-            return jsonify({"success": False, "error": "URL is required"}), 400
+        if not url:
+            return jsonify({'success': False, 'error': 'No URL provided'}), 400
         
-        logger.info(f"Downloading audio from: {video_url}")
+        print(f"Downloading audio from: {url}", flush=True)
         
-        # Create temporary directory for downloads
-        with tempfile.TemporaryDirectory() as temp_dir:
-            output_template = os.path.join(temp_dir, 'audio.%(ext)s')
-            
-            # yt-dlp options for audio download (no conversion)
-            base_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': output_template,
-                'quiet': True,
-                'no_warnings': True,
-            }
-            
-            # Add Instagram cookies if available
-            ydl_opts = get_ydl_opts_with_cookies(base_opts)
-            
-            # Download audio
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=True)
-                
-                # Find the downloaded audio file
-                downloaded_file = None
-                for file in os.listdir(temp_dir):
-                    if file.startswith('audio.'):
-                        downloaded_file = os.path.join(temp_dir, file)
-                        break
-                
-                if not downloaded_file or not os.path.exists(downloaded_file):
-                    return jsonify({
-                        "success": False,
-                        "error": "Audio file was not created"
-                    }), 500
-                
-                # Determine MIME type from extension
-                ext = os.path.splitext(downloaded_file)[1].lower()
-                mime_type_map = {
-                    '.mp3': 'audio/mpeg',
-                    '.m4a': 'audio/mp4',
-                    '.webm': 'audio/webm',
-                    '.opus': 'audio/opus',
-                    '.ogg': 'audio/ogg',
-                    '.wav': 'audio/wav',
-                }
-                mime_type = mime_type_map.get(ext, 'audio/mpeg')
-                
-                # Read audio file and encode to base64
-                with open(downloaded_file, 'rb') as f:
-                    audio_data = f.read()
-                    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-                
-                # Check file size (limit to 16MB for Whisper API)
-                file_size_mb = len(audio_data) / (1024 * 1024)
-                if file_size_mb > 16:
-                    return jsonify({
-                        "success": False,
-                        "error": f"Audio file too large: {file_size_mb:.2f}MB (max 16MB)"
-                    }), 400
-                
-                response_data = {
-                    "success": True,
-                    "audio_base64": audio_base64,
-                    "mime_type": mime_type,
-                    "title": info.get('title', 'Unknown'),
-                    "duration": info.get('duration', 0),
-                    "platform": info.get('extractor', 'unknown'),
-                    "file_size_mb": round(file_size_mb, 2)
-                }
-                
-                logger.info(f"Successfully processed audio: {info.get('title')} ({file_size_mb:.2f}MB, {mime_type})")
-                return jsonify(response_data)
-            
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"Download error: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": f"Failed to download video: {str(e)}"
-        }), 400
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": f"Server error: {str(e)}"
-        }), 500
-
-@app.route('/download', methods=['POST'])
-def download_video():
-    """
-    Download video from URL and return direct download link
-    
-    Request body:
-    {
-        "url": "https://www.instagram.com/reel/...",
-        "format": "best"  # optional
-    }
-    
-    Response:
-    {
-        "success": true,
-        "video_url": "https://direct-link-to-video.mp4",
-        "audio_url": "https://direct-link-to-audio.m4a",
-        "title": "Video Title",
-        "duration": 30,
-        "thumbnail": "https://thumbnail-url.jpg"
-    }
-    """
-    try:
-        data = request.json
-        video_url = data.get('url')
-        format_type = data.get('format', 'best')
+        # Get yt-dlp options with cookies
+        ydl_opts = get_ydl_opts_with_cookies()
         
-        if not video_url:
-            return jsonify({"success": False, "error": "URL is required"}), 400
-        
-        logger.info(f"Processing video URL: {video_url}")
-        
-        # yt-dlp options
-        base_opts = {
-            'format': format_type,
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-        }
-        
-        # Add Instagram cookies if available
-        ydl_opts = get_ydl_opts_with_cookies(base_opts)
-        
-        # Extract video info without downloading
+        # Extract video info first to get metadata
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
+            try:
+                info = ydl.extract_info(url, download=False)
+                
+                # Extract metadata
+                metadata = {
+                    'title': info.get('title', 'Unknown'),
+                    'creator': info.get('uploader', info.get('channel', 'Unknown')),
+                    'creator_handle': info.get('uploader_id', info.get('channel_id', '')),
+                    'views': info.get('view_count', 0),
+                    'likes': info.get('like_count', 0),
+                    'comments': info.get('comment_count', 0),
+                    'upload_date': info.get('upload_date', ''),
+                    'duration': info.get('duration', 0),
+                    'platform': info.get('extractor_key', '').lower()
+                }
+                
+                print(f"Metadata extracted: {metadata['title']} by @{metadata['creator_handle']}", flush=True)
+                
+            except Exception as e:
+                error_msg = str(e)
+                friendly_error = format_error_message(error_msg)
+                print(f"Download error: {error_msg}", flush=True)
+                return jsonify({
+                    'success': False,
+                    'error': friendly_error,
+                    'technical_error': error_msg
+                }), 400
+        
+        # Now download the audio
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_template = os.path.join(temp_dir, 'audio')
             
-            # Get the best video and audio URLs
-            video_direct_url = info.get('url')
+            download_opts = ydl_opts.copy()
+            download_opts['outtmpl'] = output_template
+            download_opts['format'] = 'bestaudio/best'
             
-            # Try to get separate audio URL if available
-            audio_url = None
-            if 'requested_formats' in info:
-                for fmt in info['requested_formats']:
-                    if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
-                        audio_url = fmt.get('url')
-                        break
+            with yt_dlp.YoutubeDL(download_opts) as ydl:
+                try:
+                    ydl.download([url])
+                except Exception as e:
+                    error_msg = str(e)
+                    friendly_error = format_error_message(error_msg)
+                    print(f"Download error: {error_msg}", flush=True)
+                    return jsonify({
+                        'success': False,
+                        'error': friendly_error,
+                        'technical_error': error_msg
+                    }), 400
             
-            response_data = {
-                "success": True,
-                "video_url": video_direct_url,
-                "audio_url": audio_url or video_direct_url,
-                "title": info.get('title', 'Unknown'),
-                "duration": info.get('duration', 0),
-                "thumbnail": info.get('thumbnail', ''),
-                "platform": info.get('extractor', 'unknown'),
-                "description": info.get('description', '')[:500] if info.get('description') else ''
+            # Find the downloaded audio file
+            audio_files = [f for f in os.listdir(temp_dir) if f.startswith('audio')]
+            
+            if not audio_files:
+                return jsonify({
+                    'success': False,
+                    'error': 'Audio file not found after download'
+                }), 500
+            
+            audio_path = os.path.join(temp_dir, audio_files[0])
+            
+            # Check file size (16MB limit for Whisper)
+            file_size = os.path.getsize(audio_path)
+            file_size_mb = file_size / (1024 * 1024)
+            
+            if file_size_mb > 16:
+                return jsonify({
+                    'success': False,
+                    'error': f'Audio file too large ({file_size_mb:.1f}MB). Maximum size is 16MB.'
+                }), 400
+            
+            # Read and encode audio file
+            with open(audio_path, 'rb') as f:
+                audio_data = f.read()
+                audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+            
+            # Determine MIME type from file extension
+            file_ext = os.path.splitext(audio_path)[1].lower()
+            mime_types = {
+                '.mp3': 'audio/mpeg',
+                '.m4a': 'audio/mp4',
+                '.webm': 'audio/webm',
+                '.opus': 'audio/opus',
+                '.ogg': 'audio/ogg',
+                '.wav': 'audio/wav'
             }
+            mime_type = mime_types.get(file_ext, 'audio/mpeg')
             
-            logger.info(f"Successfully processed: {info.get('title')}")
-            return jsonify(response_data)
+            print(f"Audio downloaded successfully: {file_size_mb:.2f}MB ({mime_type})", flush=True)
             
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"Download error: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": f"Failed to download video: {str(e)}"
-        }), 400
+            return jsonify({
+                'success': True,
+                'audio_base64': audio_base64,
+                'mime_type': mime_type,
+                'file_size_mb': round(file_size_mb, 2),
+                'metadata': metadata
+            })
+    
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
+        error_msg = str(e)
+        friendly_error = format_error_message(error_msg)
+        print(f"Unexpected error: {error_msg}", flush=True)
         return jsonify({
-            "success": False,
-            "error": f"Server error: {str(e)}"
+            'success': False,
+            'error': friendly_error,
+            'technical_error': error_msg
         }), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=8080)
