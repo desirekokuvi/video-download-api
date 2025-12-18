@@ -5,6 +5,7 @@ import os
 import tempfile
 import logging
 import json
+import base64
 
 app = Flask(__name__)
 CORS(app)  # Allow requests from your Manus app
@@ -63,6 +64,106 @@ def get_ydl_opts_with_cookies(base_opts):
 def health_check():
     """Health check endpoint"""
     return jsonify({"status": "healthy", "service": "video-download-api"})
+
+@app.route('/download-audio-base64', methods=['POST'])
+def download_audio_base64():
+    """
+    Download video, extract audio, and return as base64
+    
+    Request body:
+    {
+        "url": "https://www.tiktok.com/...",
+    }
+    
+    Response:
+    {
+        "success": true,
+        "audio_base64": "base64-encoded-audio-data",
+        "mime_type": "audio/mpeg",
+        "title": "Video Title",
+        "duration": 30
+    }
+    """
+    try:
+        data = request.json
+        video_url = data.get('url')
+        
+        if not video_url:
+            return jsonify({"success": False, "error": "URL is required"}), 400
+        
+        logger.info(f"Downloading audio from: {video_url}")
+        
+        # Create temporary directory for downloads
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_template = os.path.join(temp_dir, 'audio.%(ext)s')
+            
+            # yt-dlp options for audio download
+            base_opts = {
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'outtmpl': output_template,
+                'quiet': True,
+                'no_warnings': True,
+            }
+            
+            # Add Instagram cookies if available
+            ydl_opts = get_ydl_opts_with_cookies(base_opts)
+            
+            # Download audio
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=True)
+                
+                # Find the downloaded audio file
+                audio_file = os.path.join(temp_dir, 'audio.mp3')
+                
+                if not os.path.exists(audio_file):
+                    return jsonify({
+                        "success": False,
+                        "error": "Audio file was not created"
+                    }), 500
+                
+                # Read audio file and encode to base64
+                with open(audio_file, 'rb') as f:
+                    audio_data = f.read()
+                    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                
+                # Check file size (limit to 16MB for Whisper API)
+                file_size_mb = len(audio_data) / (1024 * 1024)
+                if file_size_mb > 16:
+                    return jsonify({
+                        "success": False,
+                        "error": f"Audio file too large: {file_size_mb:.2f}MB (max 16MB)"
+                    }), 400
+                
+                response_data = {
+                    "success": True,
+                    "audio_base64": audio_base64,
+                    "mime_type": "audio/mpeg",
+                    "title": info.get('title', 'Unknown'),
+                    "duration": info.get('duration', 0),
+                    "platform": info.get('extractor', 'unknown'),
+                    "file_size_mb": round(file_size_mb, 2)
+                }
+                
+                logger.info(f"Successfully processed audio: {info.get('title')} ({file_size_mb:.2f}MB)")
+                return jsonify(response_data)
+            
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"Download error: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": f"Failed to download video: {str(e)}"
+        }), 400
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": f"Server error: {str(e)}"
+        }), 500
 
 @app.route('/download', methods=['POST'])
 def download_video():
@@ -146,67 +247,6 @@ def download_video():
         return jsonify({
             "success": False,
             "error": f"Server error: {str(e)}"
-        }), 500
-
-@app.route('/extract-audio', methods=['POST'])
-def extract_audio_only():
-    """
-    Extract only audio from video URL
-    
-    Request body:
-    {
-        "url": "https://www.youtube.com/watch?v=..."
-    }
-    
-    Response:
-    {
-        "success": true,
-        "audio_url": "https://direct-link-to-audio.m4a",
-        "title": "Video Title",
-        "duration": 30
-    }
-    """
-    try:
-        data = request.json
-        video_url = data.get('url')
-        
-        if not video_url:
-            return jsonify({"success": False, "error": "URL is required"}), 400
-        
-        logger.info(f"Extracting audio from: {video_url}")
-        
-        # yt-dlp options for audio only
-        base_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-        }
-        
-        # Add Instagram cookies if available
-        ydl_opts = get_ydl_opts_with_cookies(base_opts)
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            
-            audio_url = info.get('url')
-            
-            response_data = {
-                "success": True,
-                "audio_url": audio_url,
-                "title": info.get('title', 'Unknown'),
-                "duration": info.get('duration', 0),
-                "platform": info.get('extractor', 'unknown')
-            }
-            
-            logger.info(f"Successfully extracted audio: {info.get('title')}")
-            return jsonify(response_data)
-            
-    except Exception as e:
-        logger.error(f"Error extracting audio: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": f"Failed to extract audio: {str(e)}"
         }), 500
 
 if __name__ == '__main__':
